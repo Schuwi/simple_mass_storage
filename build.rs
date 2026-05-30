@@ -1,11 +1,8 @@
-
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-
 fn main() {
-    
     // Retrieve the target chip series from the environment variable
     let target = "stm32f401.svd";
 
@@ -37,5 +34,4 @@ fn main() {
 
         println!("SVD file saved to {:?}", output_path);
     }
-    
 }

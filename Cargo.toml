@@ -5,13 +5,17 @@ authors = ["Schuwi <schuwi4@gmail.com>"]
 edition = "2021"
 
 [dependencies]
-cortex-m = "0.7"
+# "critical-section-single-core" needed for static_cell crate
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 panic-probe = { version = "0.3.1", features = ["defmt"] }
-rtic = "2"
-usbd_mass_storage = "0.1.0"
+rtic = { version = "2", features = ["thumbv7-backend"] }
 defmt-rtt = "1.2.0"
 defmt = "1.1.0"
+static_cell = "2.1.1"
+usb-device = "0.3.2"
+usbd-storage = { version = "2.0.0", features = ["bbb", "defmt", "scsi"] }
+stm32-device-signature = { version = "0.3.3", features = ["stm32f4"] }
 
 [dependencies.stm32f4xx-hal]
 version = "0.23.0"
