@@ -28,6 +28,10 @@ features = ["stm32f401", "rtic2", "defmt", "usb_fs"]
 
 [build-dependencies]
 reqwest = { version = "0.11", features = ["blocking"] }
+# Builds the embedded FAT image from `assets/` at compile time (see build.rs /
+# build/fat_image.rs). `chrono` is disabled on purpose so the default time
+# provider is `NullTimeProvider`, keeping the generated image reproducible.
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 
 
 # Set the default for dependencies.

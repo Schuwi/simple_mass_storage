@@ -17,7 +17,11 @@ const IMAGE_BLOCK_SIZE: u32 = 512;
 const IMAGE_BLOCKS_NUM: u32 = 512;
 
 const IMAGE_SIZE: usize = (IMAGE_BLOCKS_NUM * IMAGE_BLOCK_SIZE) as usize;
-static IMAGE: [u8; IMAGE_SIZE] = [0; IMAGE_SIZE];
+// Built from `assets/` at compile time by build.rs (see build/fat_image.rs),
+// with entry timestamps taken from git history, and emitted to
+// `$OUT_DIR/image.img`. The `[u8; IMAGE_SIZE]` annotation makes a size mismatch
+// a compile error, so IMAGE_SIZE here must match build.rs.
+static IMAGE: &[u8; IMAGE_SIZE] = include_bytes!(concat!(env!("OUT_DIR"), "/image.img"));
 
 #[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [ADC])]
 mod app {
