@@ -45,6 +45,14 @@ zx0-decompress = { path = "crates/zx0-decompress" }
 [profile.dev.package."*"]
 opt-level = "s"
 
+# Optimize the build script and its dependencies (notably the `zx0` compressor,
+# which is extremely slow when built unoptimized) so image compression at build
+# time is fast in every profile. Built once, then cached.
+[profile.dev.build-override]
+opt-level = 3
+[profile.release.build-override]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 incremental = false

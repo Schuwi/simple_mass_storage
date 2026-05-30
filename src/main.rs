@@ -13,10 +13,12 @@ const USB_VID: u16 = 0x1209;
 // TODO apply for our own PID before proper release
 const USB_PID: u16 = 0x0001;
 
+const IMAGE_SIZE: usize = 4 * 1024 * 1024; // 4MiB
 const IMAGE_BLOCK_SIZE: u32 = 512;
-const IMAGE_BLOCKS_NUM: u32 = 512;
 
-const IMAGE_SIZE: usize = (IMAGE_BLOCKS_NUM * IMAGE_BLOCK_SIZE) as usize;
+const IMAGE_BLOCKS_NUM: u32 = (IMAGE_SIZE / IMAGE_BLOCK_SIZE as usize) as u32;
+
+const _: () = assert!((IMAGE_BLOCKS_NUM * IMAGE_BLOCK_SIZE) as usize == IMAGE_SIZE);
 
 /// The embedded image, built from `assets/` at compile time by build.rs (see
 /// build/fat_image.rs, with entry timestamps from git history), then split into
@@ -71,27 +73,47 @@ mod app {
         /// Decompressed length of the cached chunk (`CHUNK_SIZE`, or less for a
         /// short final chunk).
         cached_len: usize,
+        /// Core clock, used to report each decompression's wall-clock time. The
+        /// DWT cycle counter must be enabled (done in `init`) for this to work.
+        clock_hz: u32,
     }
 
     impl ImageStore {
-        fn new(buf: &'static mut [u8; image::CHUNK_SIZE]) -> Self {
+        fn new(buf: &'static mut [u8; image::CHUNK_SIZE], clock_hz: u32) -> Self {
             Self {
                 buf,
                 cached: None,
                 cached_len: 0,
+                clock_hz,
             }
         }
 
         /// Returns the fully decompressed bytes of chunk `index`, decompressing it
         /// into `buf` first unless it is already cached.
+        ///
+        /// Every actual decompression is timed with the DWT cycle counter and
+        /// logged, so the cost of on-demand decoding in the read path is visible on
+        /// device. A cache hit does no work and logs nothing.
         fn chunk(&mut self, index: usize) -> &[u8] {
             if self.cached != Some(index) {
                 let (offset, len) = image::CHUNK_TABLE[index];
                 let compressed = &image::COMPRESSED[offset as usize..(offset + len) as usize];
+
+                let start = cortex_m::peripheral::DWT::cycle_count();
                 let decoded = zx0_decompress::decompress_into(compressed, self.buf.as_mut_slice())
                     .expect("embedded ZX0 chunk decodes into CHUNK_SIZE buffer");
+                let cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start);
+
                 self.cached_len = decoded.len();
                 self.cached = Some(index);
+
+                defmt::info!(
+                    "ZX0 decode chunk {}: {} B in {} cycles (~{} us)",
+                    index,
+                    self.cached_len,
+                    cycles,
+                    (u64::from(cycles) * 1_000_000 / u64::from(self.clock_hz)) as u32,
+                );
             }
             &self.buf[..self.cached_len]
         }
@@ -178,26 +200,12 @@ mod app {
             .build();
         // no device class set, only interface class
 
-        let mut store = ImageStore::new(CHUNK_BUF.take());
-
-        // One-shot benchmark: time decoding the first chunk so we can sanity-check
-        // that on-demand decompression in the read path stays well under USB MSC
-        // command timeouts. The DWT cycle counter is exact; this also primes the
-        // cache with chunk 0.
+        // Enable the DWT cycle counter so `ImageStore::chunk` can time every
+        // on-demand decompression in the read path. Must happen before the first
+        // chunk is decoded.
         core.DCB.enable_trace();
         core.DWT.enable_cycle_counter();
-        let start = cortex_m::peripheral::DWT::cycle_count();
-        let _ = store.chunk(0);
-        let cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start);
-        let hz = rcc.clocks.sysclk().to_Hz();
-        defmt::info!(
-            "ZX0 chunk decode: {} cycles (~{} us) at {} Hz; {} chunks of {} B",
-            cycles,
-            (u64::from(cycles) * 1_000_000 / u64::from(hz)) as u32,
-            hz,
-            image::CHUNK_COUNT,
-            image::CHUNK_SIZE,
-        );
+        let store = ImageStore::new(CHUNK_BUF.take(), rcc.clocks.sysclk().to_Hz());
 
         defmt::info!("Initialized");
 
@@ -319,7 +327,16 @@ mod app {
             ScsiCommand::Read { lba, len } => {
                 let total = len as usize * IMAGE_BLOCK_SIZE as usize;
 
-                if scsi_state.storage_offset != total {
+                // Reject reads that run past the end of the medium before they can
+                // index a chunk that does not exist. Use u64 so the sum cannot wrap.
+                if lba as u64 + len as u64 > IMAGE_BLOCKS_NUM as u64 {
+                    defmt::warn!("Read out of range: lba={}, len={}", lba, len);
+                    scsi_state.sense_key.replace(0x05); // ILLEGAL REQUEST
+                    scsi_state.sense_key_code.replace(0x21); // LBA OUT OF RANGE
+                    scsi_state.sense_qualifier.replace(0x00);
+                    scsi_state.storage_offset = 0;
+                    command.fail();
+                } else if scsi_state.storage_offset != total {
                     // Absolute byte offset into the decompressed image for the next
                     // byte to send. The transport calls us repeatedly, advancing
                     // `storage_offset` until the whole request is served.
