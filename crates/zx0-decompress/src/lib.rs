@@ -78,8 +78,9 @@ pub enum Zx0Error<E> {
 /// Most of the stream is read bit-by-bit, MSB first, refilling a byte at a time.
 /// The one exception is the offset LSB of a "copy from new offset" block: it is
 /// a raw byte whose top 7 bits are the LSB value and whose bit 0 is fed back
-/// into the bitstream as the next bit. That "backtrack" behaviour is confined to
-/// [`BitReader::read_offset_lsb`] so the decode loop never touches it directly.
+/// into the bitstream as the next bit. [`BitReader::read_offset_lsb`] stashes
+/// that bit in `pending_bit` and the next [`BitReader::read_bit`] pops it, so
+/// the decode loop never has to reason about it.
 struct BitReader<'a> {
     input: &'a [u8],
     /// Index of the next unread input byte.
@@ -88,10 +89,9 @@ struct BitReader<'a> {
     bit_mask: u8,
     /// The byte currently being read bit-by-bit.
     bit_value: u8,
-    /// The most recently read byte, used to feed back the offset LSB bit 0.
-    last_byte: u8,
-    /// When set, the next [`BitReader::read_bit`] returns `last_byte & 1`.
-    backtrack: bool,
+    /// A bit split off from an offset LSB byte that the next [`BitReader::read_bit`]
+    /// must return before reading from the bitstream again.
+    pending_bit: Option<u8>,
 }
 
 impl<'a> BitReader<'a> {
@@ -101,8 +101,7 @@ impl<'a> BitReader<'a> {
             pos: 0,
             bit_mask: 0,
             bit_value: 0,
-            last_byte: 0,
-            backtrack: false,
+            pending_bit: None,
         }
     }
 
@@ -110,15 +109,13 @@ impl<'a> BitReader<'a> {
     fn read_byte<E>(&mut self) -> Result<u8, Zx0Error<E>> {
         let byte = *self.input.get(self.pos).ok_or(Zx0Error::TruncatedInput)?;
         self.pos += 1;
-        self.last_byte = byte;
         Ok(byte)
     }
 
     /// Reads a single bit, MSB first.
     fn read_bit<E>(&mut self) -> Result<u8, Zx0Error<E>> {
-        if self.backtrack {
-            self.backtrack = false;
-            return Ok(self.last_byte & 1);
+        if let Some(bit) = self.pending_bit.take() {
+            return Ok(bit);
         }
         if self.bit_mask == 0 {
             self.bit_value = self.read_byte()?;
@@ -149,11 +146,11 @@ impl<'a> BitReader<'a> {
 
     /// Reads the offset LSB byte of a "copy from new offset" block.
     ///
-    /// The top 7 bits are returned as the LSB value (`0..=127`); bit 0 is armed
-    /// to be reused by the next [`BitReader::read_bit`].
+    /// The top 7 bits are returned as the LSB value (`0..=127`); bit 0 is stashed
+    /// as the pending bit for the next [`BitReader::read_bit`].
     fn read_offset_lsb<E>(&mut self) -> Result<usize, Zx0Error<E>> {
         let byte = self.read_byte()?;
-        self.backtrack = true;
+        self.pending_bit = Some(byte & 1);
         Ok(usize::from(byte >> 1))
     }
 
