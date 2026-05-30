@@ -1,0 +1,34 @@
+[package]
+name = "simple_mass_storage"
+version = "0.1.0"
+authors = ["Schuwi <schuwi4@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-probe = { version = "0.3.1", features = ["defmt"] }
+rtic = "2"
+usbd_mass_storage = "0.1.0"
+defmt-rtt = "1.2.0"
+defmt = "1.1.0"
+
+[dependencies.stm32f4xx-hal]
+version = "0.23.0"
+features = ["stm32f401", "rtic2", "defmt", "usb_fs"]
+
+
+[build-dependencies]
+reqwest = { version = "0.11", features = ["blocking"] }
+
+
+# Set the default for dependencies.
+[profile.dev.package."*"]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+incremental = false
+debug = true
+lto = true
+opt-level = "s"
