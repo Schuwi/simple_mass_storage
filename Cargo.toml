@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/zx0-decompress"]
+
 [package]
 name = "simple_mass_storage"
 version = "0.1.0"
@@ -5,6 +8,7 @@ authors = ["Schuwi <schuwi4@gmail.com>"]
 edition = "2021"
 
 [dependencies]
+zx0-decompress = { path = "crates/zx0-decompress", features = ["defmt"] }
 # "critical-section-single-core" needed for static_cell crate
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"

@@ -25,3 +25,8 @@ target = "thumbv7em-none-eabihf"
 [env]
 DEFMT_LOG = "info"
 CHIPSERIE = "stm32f401"
+
+[alias]
+# Run the host-side tests for the zx0-decompress lib crate (the workspace
+# otherwise defaults to the embedded target, which can't run tests).
+test-zx0 = "test -p zx0-decompress --target x86_64-unknown-linux-gnu"

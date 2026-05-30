@@ -1,0 +1,18 @@
+[package]
+name = "zx0-decompress"
+version = "0.1.0"
+edition = "2021"
+description = "no_std, allocation-free ZX0 (v2) decompressor"
+publish = false
+
+[dependencies]
+# Optional: derives `defmt::Format` on the error type. Enabled by the firmware,
+# left off for host `cargo test` (the host build has no defmt linker section).
+defmt = { version = "1.1.0", optional = true }
+
+[features]
+defmt = ["dep:defmt"]
+
+[dev-dependencies]
+# Reference ZX0 compressor used to generate fixtures for round-trip tests.
+zx0 = "1.0.0"

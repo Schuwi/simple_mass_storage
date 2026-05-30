@@ -1362,6 +1362,7 @@ dependencies = [
  "stm32f4xx-hal",
  "usb-device",
  "usbd-storage",
+ "zx0-decompress",
 ]
 
 [[package]]
@@ -2226,3 +2227,17 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zx0"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01df7a825d645551d63d922e23529331b04c32bec8cc56d95e7c71bdcee28146"
+
+[[package]]
+name = "zx0-decompress"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.1.0",
+ "zx0",
+]
