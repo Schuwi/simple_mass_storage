@@ -17,11 +17,22 @@ const IMAGE_BLOCK_SIZE: u32 = 512;
 const IMAGE_BLOCKS_NUM: u32 = 512;
 
 const IMAGE_SIZE: usize = (IMAGE_BLOCKS_NUM * IMAGE_BLOCK_SIZE) as usize;
-// Built from `assets/` at compile time by build.rs (see build/fat_image.rs),
-// with entry timestamps taken from git history, and emitted to
-// `$OUT_DIR/image.img`. The `[u8; IMAGE_SIZE]` annotation makes a size mismatch
-// a compile error, so IMAGE_SIZE here must match build.rs.
-static IMAGE: &[u8; IMAGE_SIZE] = include_bytes!(concat!(env!("OUT_DIR"), "/image.img"));
+
+/// The embedded image, built from `assets/` at compile time by build.rs (see
+/// build/fat_image.rs, with entry timestamps from git history), then split into
+/// fixed-size chunks that are each ZX0-compressed independently. This generated
+/// module exposes the compressed blob, the per-chunk `(offset, len)` table, and
+/// `CHUNK_SIZE` / `CHUNK_COUNT` / `IMAGE_LEN`. The firmware decompresses one
+/// chunk at a time on demand (see [`app::ImageStore`]).
+mod image {
+    include!(concat!(env!("OUT_DIR"), "/image.rs"));
+}
+
+// Keep the SCSI-reported capacity and the generated image in lockstep, and make
+// sure a single buffer can serve as both the ZX0 decode window and the chunk
+// cache (the buffer must exceed ZX0's maximum back-reference distance).
+const _: () = assert!(image::IMAGE_LEN == IMAGE_SIZE);
+const _: () = assert!(image::CHUNK_SIZE >= zx0_decompress::MIN_WINDOW_LEN);
 
 #[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [ADC])]
 mod app {
@@ -44,9 +55,47 @@ mod app {
         },
     };
 
-    use crate::{IMAGE, IMAGE_BLOCK_SIZE, IMAGE_BLOCKS_NUM, USB_PID, USB_VID};
+    use crate::{image, IMAGE_BLOCK_SIZE, IMAGE_BLOCKS_NUM, USB_PID, USB_VID};
 
     type ScsiType = Scsi<BulkOnly<'static, UsbBusType, &'static mut [u8]>>;
+
+    /// Serves the read-only image by decompressing one ZX0 chunk at a time into a
+    /// single reusable buffer that doubles as the decode window and the chunk
+    /// cache. Sequential reads stay within a cached chunk; crossing a chunk
+    /// boundary triggers exactly one decompression.
+    pub struct ImageStore {
+        /// Decode window + resident copy of the currently cached chunk.
+        buf: &'static mut [u8; image::CHUNK_SIZE],
+        /// Index of the chunk currently held in `buf`, if any.
+        cached: Option<usize>,
+        /// Decompressed length of the cached chunk (`CHUNK_SIZE`, or less for a
+        /// short final chunk).
+        cached_len: usize,
+    }
+
+    impl ImageStore {
+        fn new(buf: &'static mut [u8; image::CHUNK_SIZE]) -> Self {
+            Self {
+                buf,
+                cached: None,
+                cached_len: 0,
+            }
+        }
+
+        /// Returns the fully decompressed bytes of chunk `index`, decompressing it
+        /// into `buf` first unless it is already cached.
+        fn chunk(&mut self, index: usize) -> &[u8] {
+            if self.cached != Some(index) {
+                let (offset, len) = image::CHUNK_TABLE[index];
+                let compressed = &image::COMPRESSED[offset as usize..(offset + len) as usize];
+                let decoded = zx0_decompress::decompress_into(compressed, self.buf.as_mut_slice())
+                    .expect("embedded ZX0 chunk decodes into CHUNK_SIZE buffer");
+                self.cached_len = decoded.len();
+                self.cached = Some(index);
+            }
+            &self.buf[..self.cached_len]
+        }
+    }
 
     #[derive(Default)]
     struct ScsiState {
@@ -72,6 +121,7 @@ mod app {
     struct Local {
         usb_scsi: ScsiType,
         scsi_state: ScsiState,
+        store: ImageStore,
     }
 
     #[init]
@@ -83,7 +133,12 @@ mod app {
 
         static SCSI_BUF: ConstStaticCell<[u8; 1024]> = ConstStaticCell::new([0; 1024]);
 
+        // Decode window + chunk cache for the compressed image (see `ImageStore`).
+        static CHUNK_BUF: ConstStaticCell<[u8; image::CHUNK_SIZE]> =
+            ConstStaticCell::new([0; image::CHUNK_SIZE]);
+
         let periph = ctx.device;
+        let mut core = ctx.core;
 
         // Configure necessary clock tree, will panic if configuration is not legal for hardware
         let mut rcc = periph.RCC.freeze(
@@ -123,6 +178,27 @@ mod app {
             .build();
         // no device class set, only interface class
 
+        let mut store = ImageStore::new(CHUNK_BUF.take());
+
+        // One-shot benchmark: time decoding the first chunk so we can sanity-check
+        // that on-demand decompression in the read path stays well under USB MSC
+        // command timeouts. The DWT cycle counter is exact; this also primes the
+        // cache with chunk 0.
+        core.DCB.enable_trace();
+        core.DWT.enable_cycle_counter();
+        let start = cortex_m::peripheral::DWT::cycle_count();
+        let _ = store.chunk(0);
+        let cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start);
+        let hz = rcc.clocks.sysclk().to_Hz();
+        defmt::info!(
+            "ZX0 chunk decode: {} cycles (~{} us) at {} Hz; {} chunks of {} B",
+            cycles,
+            (u64::from(cycles) * 1_000_000 / u64::from(hz)) as u32,
+            hz,
+            image::CHUNK_COUNT,
+            image::CHUNK_SIZE,
+        );
+
         defmt::info!("Initialized");
 
         (
@@ -130,16 +206,18 @@ mod app {
             Local {
                 usb_scsi,
                 scsi_state: ScsiState::default(),
+                store,
             },
         )
     }
 
-    #[task(binds=OTG_FS, shared=[usb_dev], local=[usb_scsi, scsi_state])]
+    #[task(binds=OTG_FS, shared=[usb_dev], local=[usb_scsi, scsi_state, store])]
     fn usb_fs(cx: usb_fs::Context) {
         let mut usb_dev = cx.shared.usb_dev;
         let usb_fs::LocalResources {
             usb_scsi,
             scsi_state,
+            store,
             ..
         } = cx.local;
 
@@ -147,7 +225,7 @@ mod app {
 
         if activity {
             if let Err(usb_err) = usb_scsi.poll(|command| {
-                if let Err(err) = process_command(command, scsi_state) {
+                if let Err(err) = process_command(command, scsi_state, store) {
                     defmt::error!("USB SCSI command error: {}", err);
                 }
             }) {
@@ -159,6 +237,7 @@ mod app {
     fn process_command(
         mut command: usbd_storage::subclass::Command<ScsiCommand, ScsiType>,
         scsi_state: &mut ScsiState,
+        store: &mut ImageStore,
     ) -> Result<(), TransportError<BulkOnlyError>> {
         defmt::debug!("Handling: {:#X}", command.kind);
 
@@ -238,17 +317,25 @@ mod app {
                 command.pass();
             }
             ScsiCommand::Read { lba, len } => {
-                let len = len as u32;
+                let total = len as usize * IMAGE_BLOCK_SIZE as usize;
 
-                if scsi_state.storage_offset != (len * IMAGE_BLOCK_SIZE) as usize {
-                    let start = (IMAGE_BLOCK_SIZE * lba) as usize + scsi_state.storage_offset;
-                    let end = (IMAGE_BLOCK_SIZE * lba) as usize + (IMAGE_BLOCK_SIZE * len) as usize;
+                if scsi_state.storage_offset != total {
+                    // Absolute byte offset into the decompressed image for the next
+                    // byte to send. The transport calls us repeatedly, advancing
+                    // `storage_offset` until the whole request is served.
+                    let abs = lba as usize * IMAGE_BLOCK_SIZE as usize + scsi_state.storage_offset;
+                    let chunk_index = abs / image::CHUNK_SIZE;
+                    let offset_in_chunk = abs % image::CHUNK_SIZE;
 
-                    // Uncomment this in order to push data in chunks smaller than a USB packet.
-                    // let end = min(start + USB_PACKET_SIZE as usize - 1, end);
+                    // Decompress (or reuse the cached) chunk, then serve at most up
+                    // to the chunk boundary so we never read past the cached buffer
+                    // in a single call; the next call continues into the next chunk.
+                    let chunk = store.chunk(chunk_index);
+                    let available = chunk.len() - offset_in_chunk;
+                    let remaining = total - scsi_state.storage_offset;
+                    let n = available.min(remaining);
 
-                    defmt::info!("Data transfer >>>>>>>> [{}..{}]", start, end);
-                    let count = command.write_data(&IMAGE[start..end])?;
+                    let count = command.write_data(&chunk[offset_in_chunk..offset_in_chunk + n])?;
                     scsi_state.storage_offset += count;
                 } else {
                     command.pass();

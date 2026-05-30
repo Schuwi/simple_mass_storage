@@ -1374,6 +1374,7 @@ dependencies = [
  "stm32f4xx-hal",
  "usb-device",
  "usbd-storage",
+ "zx0",
  "zx0-decompress",
 ]
 

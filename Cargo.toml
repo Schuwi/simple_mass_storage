@@ -32,6 +32,13 @@ reqwest = { version = "0.11", features = ["blocking"] }
 # build/fat_image.rs). `chrono` is disabled on purpose so the default time
 # provider is `NullTimeProvider`, keeping the generated image reproducible.
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+# ZX0 (v2) compressor: the image is split into fixed-size chunks, each compressed
+# independently, so the firmware can decompress one chunk at a time on demand.
+zx0 = "1.0.0"
+# The firmware's own decompressor, used at build time to verify each compressed
+# chunk decodes back to the original before it is embedded. No `defmt` here (host
+# build); the firmware enables that feature in [dependencies].
+zx0-decompress = { path = "crates/zx0-decompress" }
 
 
 # Set the default for dependencies.

@@ -36,6 +36,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+use core::convert::Infallible;
+
 /// Maximum back-reference distance the ZX0 v2 format can encode.
 ///
 /// The offset is `msb * 128 - (lsb >> 1)` with `msb` in `1..=255` and the low
@@ -67,6 +69,10 @@ pub enum Zx0Error<E> {
     InvalidOffset,
     /// The window slice was shorter than [`MIN_WINDOW_LEN`].
     WindowTooSmall,
+    /// [`decompress_into`] was given a buffer too small to hold the whole
+    /// decompressed output. (Distinct from [`Zx0Error::WindowTooSmall`], which is
+    /// about the back-reference window minimum, not the total output size.)
+    OutputTooLarge,
     /// The stream ended cleanly but input bytes remained afterwards.
     TrailingData,
     /// The output callback returned an error; decompression was aborted.
@@ -313,6 +319,56 @@ where
     }
 }
 
+/// Decompresses a ZX0 v2 stream whose entire output fits in `buffer`, returning
+/// the decompressed bytes as a sub-slice of `buffer`.
+///
+/// Unlike [`decompress`] — which streams output through a callback and only needs
+/// a [`MIN_WINDOW_LEN`]-sized scratch window — this leaves the whole decompressed
+/// block sitting in `buffer`, so the decode window *is* the destination: no
+/// separate output storage is required. This is the entry point for random-access
+/// use such as serving fixed-size blocks: decode a block once into `buffer`, then
+/// read any byte range of the returned slice as many times as you like.
+///
+/// `buffer` serves double duty as the back-reference window and the output, so it
+/// must be both at least [`MIN_WINDOW_LEN`] bytes *and* large enough to hold the
+/// decompressed output. The result borrows `buffer` for as long as it is read.
+///
+/// # Errors
+///
+/// - [`Zx0Error::WindowTooSmall`] if `buffer` is shorter than [`MIN_WINDOW_LEN`].
+/// - [`Zx0Error::OutputTooLarge`] if the decompressed output exceeds `buffer`.
+/// - the same input/format errors as [`decompress`] for a malformed stream.
+///
+/// ```ignore
+/// let mut buf = [0u8; 0x8000];
+/// let block = zx0_decompress::decompress_into(compressed_block, &mut buf)?;
+/// // `block` is the fully decompressed block; index into it freely.
+/// ```
+pub fn decompress_into<'b>(
+    input: &[u8],
+    buffer: &'b mut [u8],
+) -> Result<&'b [u8], Zx0Error<Infallible>> {
+    let capacity = buffer.len();
+    let mut produced = 0usize;
+    let mut flushes = 0u32;
+
+    decompress(input, buffer, |chunk| {
+        produced += chunk.len();
+        flushes += 1;
+        Ok::<(), Infallible>(())
+    })?;
+
+    // The window flushes (and wraps) exactly when it fills, so a *single* flush
+    // means the output never wrapped and is laid out linearly at `buffer[..produced]`.
+    // More than one flush means the output is larger than `buffer` and its start
+    // has already been overwritten -- unusable, so report it rather than return
+    // corrupt data.
+    if flushes > 1 || produced > capacity {
+        return Err(Zx0Error::OutputTooLarge);
+    }
+    Ok(&buffer[..produced])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +486,42 @@ mod tests {
         let mut window = [0u8; 0x8000];
         let result = decompress::<Infallible, _>(&compressed, &mut window, |_| Ok(()));
         assert_eq!(result, Err(Zx0Error::TrailingData));
+    }
+
+    #[test]
+    fn into_buffer_roundtrips_when_it_fits() {
+        // Outputs smaller than and exactly equal to the buffer (the exact-fit
+        // case is where the window flushes once and wraps on the final byte).
+        for &n in &[1usize, 100, 4096, 32_767, 32_768] {
+            let data = pseudo_random_mixed(n);
+            let compressed = zx0::compress(&data);
+            let mut buf = [0u8; 32_768];
+            let out = decompress_into(&compressed, &mut buf).expect("output fits");
+            assert_eq!(out, &data[..], "mismatch for n={n}");
+        }
+    }
+
+    #[test]
+    fn into_buffer_rejects_output_larger_than_buffer() {
+        // Buffer is >= MIN_WINDOW_LEN (so not WindowTooSmall) but smaller than the
+        // 40 KiB output.
+        let data = pseudo_random_mixed(40_000);
+        let compressed = zx0::compress(&data);
+        let mut buf = [0u8; 32_768];
+        assert_eq!(
+            decompress_into(&compressed, &mut buf),
+            Err(Zx0Error::OutputTooLarge)
+        );
+    }
+
+    #[test]
+    fn into_buffer_rejects_window_below_minimum() {
+        let compressed = zx0::compress(b"hello");
+        let mut buf = [0u8; MIN_WINDOW_LEN - 1];
+        assert_eq!(
+            decompress_into(&compressed, &mut buf),
+            Err(Zx0Error::WindowTooSmall)
+        );
     }
 
     #[test]
