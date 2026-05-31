@@ -197,9 +197,9 @@ fn relock() -> Result<()> {
         );
     }
 
-    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut entries: Vec<LockEntry> = Vec::new();
     collect_consumed(&vendor, &vendor, &mut entries)?;
-    entries.sort();
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
     if entries.is_empty() {
         bail!("no SEGGER files found under {}", vendor.display());
     }
@@ -207,6 +207,7 @@ fn relock() -> Result<()> {
     let usb_version = read_usb_version(&vendor).unwrap_or_else(|_| "unknown".into());
 
     let mut out = String::new();
+    let total: u64 = entries.iter().map(|e| e.size).sum();
     out.push_str("# SEGGER emUSB-Device vendored-file lock -- DO NOT edit by hand.\n");
     out.push_str("# Regenerate with `cargo xtask relock-segger` after a sanctioned\n");
     out.push_str("# version bump. These files are NOT committed (SFL forbids it);\n");
@@ -214,8 +215,10 @@ fn relock() -> Result<()> {
     out.push_str(&format!("# bundle = {BUNDLE_NAME}\n"));
     out.push_str(&format!("# bundle_md5 = {BUNDLE_MD5}\n"));
     out.push_str(&format!("# emusb_device_version = {usb_version}\n"));
-    for (hash, rel) in &entries {
-        out.push_str(&format!("{hash}  {rel}\n"));
+    out.push_str(&format!("# files = {}, total = {total} bytes\n", entries.len()));
+    out.push_str("# columns: <sha256>  <size-bytes>  <path>\n");
+    for e in &entries {
+        out.push_str(&format!("{}  {:>9}  {}\n", e.hash, e.size, e.rel));
     }
 
     let lock = root.join("vendor/segger.lock");
@@ -228,7 +231,19 @@ fn relock() -> Result<()> {
     Ok(())
 }
 
-fn collect_consumed(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
+/// One vendored file's pinned identity.
+//
+// TODO(enhancement): for the `.a`, additionally record per-member (.o) sizes and
+// hashes (`ar t` + per-object SHA-256). That would pinpoint *which* object (e.g.
+// the ST FS driver vs. MSD core) changed across SEGGER versions, instead of just
+// flagging the whole archive as different.
+struct LockEntry {
+    hash: String,
+    size: u64,
+    rel: String,
+}
+
+fn collect_consumed(base: &Path, dir: &Path, out: &mut Vec<LockEntry>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -239,7 +254,11 @@ fn collect_consumed(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) ->
                 .to_string_lossy()
                 .replace('\\', "/");
             if is_consumed(&rel) {
-                out.push((sha256_file(&path)?, rel));
+                out.push(LockEntry {
+                    hash: sha256_file(&path)?,
+                    size: fs::metadata(&path)?.len(),
+                    rel,
+                });
             }
         }
     }
@@ -279,9 +298,11 @@ fn verify_against_lock(vendor: &Path, lock: &Path) -> Result<Verify> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (hash, rel) = line
-            .split_once("  ")
-            .ok_or_else(|| anyhow!("malformed lock line: {line}"))?;
+        // columns: <sha256>  <size>  <path>
+        let mut cols = line.split_whitespace();
+        let hash = cols.next().ok_or_else(|| anyhow!("malformed lock line: {line}"))?;
+        let _size = cols.next();
+        let rel = cols.next().ok_or_else(|| anyhow!("malformed lock line: {line}"))?;
         let path = vendor.join(rel);
         let ok = path.exists() && sha256_file(&path)? == hash;
         if !ok {

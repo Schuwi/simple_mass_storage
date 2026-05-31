@@ -24,6 +24,29 @@ $ cargo install probe-rs --features cli
 $ rustup target add thumbv6m-none-eabi thumbv7m-none-eabi thumbv7em-none-eabi thumbv7em-none-eabihf
 ```
 
+## Building: SEGGER emUSB-Device dependency
+
+This firmware's USB stack is **SEGGER emUSB-Device**, a proprietary library used
+under [SEGGER's Friendly License](https://www.segger.com/purchase/licensing/license-sfl/)
+(free for non-commercial / hobby use). That licence **forbids redistribution**,
+so the SEGGER headers and prebuilt library are **not** committed here — and a
+plain `cargo build` will fail until you provide them locally, once.
+
+Two ways to do that:
+
+``` console
+# Contributors with access to the private submodule:
+$ git submodule update --init vendor/segger
+
+# Or bring your own SEGGER eval copy (free for non-commercial use):
+$ cargo xtask setup-segger --zip /path/to/SeggerEval_...zip
+```
+
+Then `cargo build --release` as usual. You will also need `libclang` (for
+`bindgen`) and the `thumbv7em-none-eabihf` target. Full instructions, the exact
+eval bundle, and troubleshooting are in
+**[`docs/SEGGER_SETUP.md`](docs/SEGGER_SETUP.md)**.
+
 ## Instantiate the template.
 
 1. Run and enter project name

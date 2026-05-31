@@ -98,7 +98,9 @@ fn verify_lock(lock: &Path, vendor_root: &Path) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((want, rel)) = line.split_once("  ") else {
+        // columns: <sha256>  <size>  <path>
+        let mut cols = line.split_whitespace();
+        let (Some(want), _size, Some(rel)) = (cols.next(), cols.next(), cols.next()) else {
             continue;
         };
         let path = vendor_root.join(rel);

@@ -1,6 +1,8 @@
 /target
+/xtask/target
 
 # SEGGER emUSB-Device files are proprietary (SFL) and MUST NOT be committed.
 # They are provided locally via `cargo xtask setup-segger` or the private submodule.
-# See docs/SEGGER_SETUP.md.
-/vendor/segger
+# See docs/SEGGER_SETUP.md. The committed README placeholder is the exception.
+/vendor/segger/*
+!/vendor/segger/README.md
