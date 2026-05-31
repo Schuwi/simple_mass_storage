@@ -194,11 +194,18 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) 
         );
     }
 
+    // `fatfs` 0.3.6 emits a spurious long-name entry in front of the `.` and `..`
+    // entries of every subdirectory it creates, which violates the FAT spec (dot
+    // entries must be bare 8.3 entries) and makes strict validators reject the
+    // volume. Rewrite them into the canonical layout before the image is sealed.
+    let mut part = cursor.into_inner();
+    fix_dot_entries(&mut part);
+
     // Assemble the full disk: MBR in sector 0, then the formatted partition at
     // PART_START_LBA. The gap between them stays zero.
     let mut image = vec![0u8; size];
     let part_off = PART_START_LBA as usize * 512;
-    image[part_off..part_off + part_size].copy_from_slice(&cursor.into_inner());
+    image[part_off..part_off + part_size].copy_from_slice(&part);
     write_mbr(&mut image, PART_START_LBA, part_sectors, fat_type);
 
     println!(
@@ -207,10 +214,10 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) 
         part_size / 1024
     );
 
-
     // Guard the wide-compatibility layout against regressions: cheap byte-level
     // checks on the hand-written MBR, plus an independent `fsck.fat` pass over the
-    // filesystem properties.
+    // filesystem (so we are not just trusting `fatfs` to read back what `fatfs`
+    // wrote). The latter is skippable -- see `verify_filesystem`.
     verify_mbr(&image, part_sectors);
     verify_filesystem(&image[part_off..part_off + part_size]);
 
@@ -310,6 +317,11 @@ fn verify_filesystem(part: &[u8]) {
     let report = String::from_utf8_lossy(&output.stdout);
     let _ = fs::remove_file(&img);
 
+    assert!(
+        output.status.success(),
+        "fsck.fat reported errors in the FAT image:\n{report}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     // fsck.fat -v prints e.g. "512 bytes per cluster" and "2 FATs, 16 bit entries".
     assert!(
         report.contains(&format!("{CLUSTER_SIZE} bytes per cluster")),
@@ -320,6 +332,151 @@ fn verify_filesystem(part: &[u8]) {
         "fsck.fat did not confirm a 16-bit (FAT16) FAT:\n{report}"
     );
     println!("cargo:warning=fsck.fat ({tool}) verified the FAT16 image");
+}
+
+/// On-disk geometry of a formatted FAT12/16 volume, derived from its BPB. Just
+/// enough to walk the directory tree and address clusters in the raw image.
+struct FatGeometry {
+    fat_start: usize,
+    root_start: usize,
+    data_start: usize,
+    cluster_bytes: usize,
+}
+
+impl FatGeometry {
+    /// Parse the relevant BPB fields from the boot sector at the start of `part`.
+    fn parse(part: &[u8]) -> Self {
+        let rd16 = |i: usize| u16::from_le_bytes([part[i], part[i + 1]]) as usize;
+        let bytes_per_sector = rd16(11);
+        let sectors_per_cluster = part[13] as usize;
+        let reserved_sectors = rd16(14);
+        let num_fats = part[16] as usize;
+        let root_entries = rd16(17);
+        let sectors_per_fat = rd16(22); // BPB_FATSz16 (FAT12/16)
+
+        let fat_start = reserved_sectors * bytes_per_sector;
+        let root_start = (reserved_sectors + num_fats * sectors_per_fat) * bytes_per_sector;
+        // The root directory occupies a whole number of sectors right after the FATs.
+        let root_bytes = (root_entries * DIR_ENTRY_LEN).div_ceil(bytes_per_sector) * bytes_per_sector;
+        FatGeometry {
+            fat_start,
+            root_start,
+            data_start: root_start + root_bytes,
+            cluster_bytes: sectors_per_cluster * bytes_per_sector,
+        }
+    }
+
+    /// Byte offset of data cluster `n` (clusters are numbered from 2).
+    fn cluster_offset(&self, cluster: u32) -> usize {
+        self.data_start + (cluster as usize - 2) * self.cluster_bytes
+    }
+
+    /// Follow a FAT16 cluster chain from `first`, returning every cluster in it.
+    /// Stops at the end-of-chain marker; a visited set guards against a corrupt
+    /// cycle (which would otherwise loop forever).
+    fn chain(&self, part: &[u8], first: u32) -> Vec<u32> {
+        let mut clusters = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut c = first;
+        while c >= 2 && c < 0xFFF7 && seen.insert(c) {
+            clusters.push(c);
+            let i = self.fat_start + c as usize * 2;
+            c = u16::from_le_bytes([part[i], part[i + 1]]) as u32;
+        }
+        clusters
+    }
+}
+
+/// One FAT directory entry is 32 bytes.
+const DIR_ENTRY_LEN: usize = 32;
+/// Directory-entry attribute bits we test.
+const ATTR_LONG_NAME: u8 = 0x0F; // a VFAT long-name fragment (low nibble == 0x0F)
+const ATTR_DIRECTORY: u8 = 0x10;
+const ATTR_VOLUME_ID: u8 = 0x08;
+/// Marker bytes in the first byte of a directory entry.
+const ENTRY_END: u8 = 0x00; // no more entries in this directory
+const ENTRY_FREE: u8 = 0xE5; // deleted/free slot
+const DOT: u8 = b'.';
+
+/// Rewrite the `.`/`..` entries of every subdirectory into the spec-mandated
+/// layout: two bare 8.3 entries in slots 0 and 1, with no long-name entries.
+///
+/// `fatfs` 0.3.6 runs the dot names through its normal entry creation, which
+/// prepends a VFAT long-name entry to each, producing
+/// `[LFN, "." , LFN, ".."]`. That is invalid -- the FAT spec requires the dot
+/// entries to be plain short entries -- and strict hosts/checkers reject it. We
+/// move the two real 8.3 entries to the front and mark the now-orphaned long-name
+/// slots free, giving `[".", "..", free, free, ...]`, which is fully valid.
+///
+/// Operates directly on the raw volume bytes by walking the directory tree (the
+/// root has no dot entries, so only its descendants are touched).
+fn fix_dot_entries(part: &mut [u8]) {
+    let geom = FatGeometry::parse(part);
+
+    // Seed the walk with the subdirectories linked from the fixed-size root
+    // directory region, then process each subdirectory's chain in turn.
+    let mut pending = subdir_clusters(part, geom.root_start..geom.data_start);
+    let mut processed = std::collections::HashSet::new();
+    while let Some(cluster) = pending.pop() {
+        if !processed.insert(cluster) {
+            continue;
+        }
+        fix_dir_dots(part, geom.cluster_offset(cluster));
+        for c in geom.chain(part, cluster) {
+            let start = geom.cluster_offset(c);
+            pending.extend(subdir_clusters(part, start..start + geom.cluster_bytes));
+        }
+    }
+}
+
+/// First clusters of every subdirectory whose 8.3 entry lives in `range`,
+/// skipping long-name fragments, the volume label, deleted slots, and the `.`/`..`
+/// entries themselves. Stops at the end-of-directory marker.
+fn subdir_clusters(part: &[u8], range: std::ops::Range<usize>) -> Vec<u32> {
+    let mut out = Vec::new();
+    for off in range.step_by(DIR_ENTRY_LEN) {
+        let e = &part[off..off + DIR_ENTRY_LEN];
+        match e[0] {
+            ENTRY_END => break,
+            ENTRY_FREE | DOT => continue, // free slot, or a `.`/`..` entry
+            _ => {}
+        }
+        let attr = e[11];
+        if attr & ATTR_LONG_NAME == ATTR_LONG_NAME || attr & ATTR_VOLUME_ID != 0 {
+            continue; // long-name fragment or volume label
+        }
+        if attr & ATTR_DIRECTORY != 0 {
+            // FAT16: the high word of the first cluster (offset 20) is always 0.
+            out.push(u16::from_le_bytes([e[26], e[27]]) as u32);
+        }
+    }
+    out
+}
+
+/// Rewrite the dot entries of a single subdirectory whose first cluster begins at
+/// `off`. No-op if they are already canonical; panics on any layout other than the
+/// one `fatfs` produces, so an upstream change can't silently slip past.
+fn fix_dir_dots(part: &mut [u8], off: usize) {
+    // Classify the first four slots: a `.` short entry, a `..` short entry, or
+    // "other" (a long-name fragment, in fatfs's case).
+    let slot = |i: usize| &part[off + i * DIR_ENTRY_LEN..off + (i + 1) * DIR_ENTRY_LEN];
+    let is_dot = |i: usize| slot(i)[0] == DOT && slot(i)[1] == b' ';
+    let is_dotdot = |i: usize| slot(i)[0] == DOT && slot(i)[1] == DOT;
+
+    if is_dot(0) && is_dotdot(1) {
+        return; // already canonical
+    }
+    assert!(
+        is_dot(1) && is_dotdot(3),
+        "unexpected dot-entry layout at offset {off:#x}; \
+         expected fatfs's [LFN, '.', LFN, '..'] -- did the fatfs version change?"
+    );
+
+    // [LFN, '.', LFN, '..'] -> ['.', '..', free, free]
+    part.copy_within(off + DIR_ENTRY_LEN..off + 2 * DIR_ENTRY_LEN, off); // '.' -> slot 0
+    part.copy_within(off + 3 * DIR_ENTRY_LEN..off + 4 * DIR_ENTRY_LEN, off + DIR_ENTRY_LEN); // '..' -> slot 1
+    part[off + 2 * DIR_ENTRY_LEN] = ENTRY_FREE; // orphaned LFN -> free
+    part[off + 3 * DIR_ENTRY_LEN] = ENTRY_FREE; // old '..' slot -> free
 }
 
 /// Write a single-partition MBR into sector 0 of `image`, describing a partition

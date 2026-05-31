@@ -47,6 +47,35 @@ Then `cargo build --release` as usual. You will also need `libclang` (for
 eval bundle, and troubleshooting are in
 **[`docs/SEGGER_SETUP.md`](docs/SEGGER_SETUP.md)**.
 
+## Storage image: maximum compatibility & archival robustness
+
+This firmware presents a **read-only USB mass-storage device** whose contents are
+an embedded, ZX0-compressed FAT image built at compile time from `assets/` (plus
+an optional snapshot of the source that produced it). Because the device is meant
+for **archival** use, its guiding principle is to mount cleanly on the **widest
+possible range of hosts, now and in the future** — so the emitted image is held
+to strict spec-compliance rather than "works on the machine I tested":
+
+- **Real MBR partition table**, not the bare "superfloppy" layout (a filesystem
+  written at LBA 0 with no partition table). Some hosts — notably Android —
+  refuse to mount a superfloppy. The single partition is 1 MiB-aligned (starts at
+  LBA 2048), the alignment every modern partitioner uses.
+- **FAT16 with 512-byte clusters**, chosen deliberately over the FAT12 that small
+  volumes would otherwise default to, as FAT16 is the most broadly mounted format
+  for media this size.
+- **Spec deviations are fixed, not tolerated.** For example, the `fatfs` crate
+  emits invalid long-name entries in front of each subdirectory's `.`/`..`
+  entries; the build rewrites them into the canonical bare 8.3 form.
+- **Independent verification.** The build validates the finished image with
+  [`fsck.fat`](https://github.com/dosfstools/dosfstools) (a *different* FAT
+  implementation than the one that wrote it) and asserts the MBR layout byte for
+  byte. If `fsck.fat` isn't installed it is skipped with a warning; set
+  `SMS_SKIP_IMAGE_CHECK=1` to skip it deliberately.
+
+All of this lives in [`build/fat_image.rs`](build/fat_image.rs). When changing how
+the image is produced, **preserve this strictness** — keep the independent check
+passing and avoid anything that trades compatibility for convenience.
+
 ## Instantiate the template.
 
 1. Run and enter project name
