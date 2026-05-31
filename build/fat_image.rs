@@ -19,7 +19,7 @@
 
 use std::cell::Cell;
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -102,7 +102,7 @@ impl TimeProvider for GitTimeProvider {
 ///
 /// `size` must be a multiple of the 512-byte sector size. Panics (the right move
 /// in a build script) on any error, including the tree not fitting in `size`.
-pub fn build(src_dir: &Path, size: usize, repo_dir: &Path) -> Vec<u8> {
+pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) -> Vec<u8> {
     assert!(
         size % 512 == 0,
         "image size {size} is not a multiple of the 512-byte sector size"
@@ -131,6 +131,14 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path) -> Vec<u8> {
         let fs = FileSystem::new(&mut cursor, FsOptions::new().time_provider(&GIT_TP))
             .expect("failed to open FAT filesystem");
         add_dir(&fs.root_dir(), src_dir, repo_dir, &mut uncommitted);
+        // Make the device self-documenting: bundle the source that built it and a
+        // file naming the build version (gated by the `source-snapshot` feature).
+        // (Each `root_dir()` is a fresh temporary so no borrow outlives
+        // `fs.unmount()`, which consumes `fs`.)
+        if bundle_source {
+            add_source_snapshot(&fs.root_dir(), repo_dir);
+            add_version_file(&fs.root_dir(), repo_dir);
+        }
         fs.unmount().expect("failed to flush FAT filesystem");
     }
 
@@ -203,6 +211,141 @@ fn add_dir<T: ReadWriteSeek>(
             panic!("unsupported file type: {}", entry.path().display());
         }
     }
+}
+
+/// Bundle an unpacked snapshot of the committed source (`git archive HEAD`) under
+/// `source/` in the FAT root, so the device documents the exact tree that built it.
+///
+/// The archive is streamed through the `tar` crate in memory -- no temp files and no
+/// external `tar` binary. Every entry shares HEAD's committer date (one git call),
+/// since they all come from the same commit. The snapshot is generated fresh and
+/// never stored in the repo, so it cannot contain itself.
+fn add_source_snapshot<T: ReadWriteSeek>(root: &Dir<T>, repo_dir: &Path) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["archive", "--format=tar", "HEAD"])
+        .output()
+        .expect("failed to run `git archive`");
+    assert!(
+        output.status.success(),
+        "`git archive HEAD` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // All snapshot entries are from HEAD; stamp them with its committer date.
+    CURRENT.with(|c| c.set(head_stamp(repo_dir)));
+    ensure_dir(root, "source");
+
+    let mut archive = tar::Archive::new(Cursor::new(output.stdout));
+    for entry in archive.entries().expect("failed to read git archive") {
+        let mut entry = entry.expect("failed to read git archive entry");
+        let entry_type = entry.header().entry_type();
+        let rel = entry
+            .path()
+            .expect("git archive entry has no path")
+            .into_owned();
+        let rel = rel
+            .to_str()
+            .unwrap_or_else(|| panic!("non-UTF-8 path in git archive: {rel:?}"));
+        let dest = format!("source/{}", rel.trim_end_matches('/'));
+
+        if entry_type.is_dir() {
+            ensure_dir(root, &dest);
+        } else if entry_type.is_file() {
+            if let Some((parent, _)) = dest.rsplit_once('/') {
+                ensure_dir(root, parent);
+            }
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .unwrap_or_else(|e| panic!("failed to read git archive entry {dest:?}: {e}"));
+            let mut file = root
+                .create_file(&dest)
+                .unwrap_or_else(|e| panic!("failed to create file {dest:?}: {e:?}"));
+            file.write_all(&data)
+                .unwrap_or_else(|e| panic!("failed to write {dest:?}: {e:?}"));
+            file.flush()
+                .unwrap_or_else(|e| panic!("failed to flush {dest:?}: {e:?}"));
+        }
+        // Other entry types (symlinks etc.) are skipped; git archive of a normal
+        // tree only emits regular files and directories.
+    }
+}
+
+/// Write a `VERSION.txt` at the FAT root naming the build: `git describe`, the full
+/// commit hash, and the commit date. Stamped with HEAD's committer date.
+fn add_version_file<T: ReadWriteSeek>(root: &Dir<T>, repo_dir: &Path) {
+    let unknown = || "unknown".to_string();
+    let describe =
+        git_output(repo_dir, &["describe", "--tags", "--always", "--dirty"]).unwrap_or_else(unknown);
+    let commit = git_output(repo_dir, &["rev-parse", "HEAD"]).unwrap_or_else(unknown);
+    let date = git_output(
+        repo_dir,
+        &[
+            "log",
+            "-1",
+            "--format=%cd",
+            "--date=format-local:%Y-%m-%d %H:%M:%S",
+        ],
+    )
+    .unwrap_or_else(unknown);
+
+    let contents = format!("version: {describe}\ncommit:  {commit}\ndate:    {date}\n");
+
+    CURRENT.with(|c| c.set(head_stamp(repo_dir)));
+    let mut file = root
+        .create_file("VERSION.txt")
+        .expect("failed to create VERSION.txt");
+    file.write_all(contents.as_bytes())
+        .expect("failed to write VERSION.txt");
+    file.flush().expect("failed to flush VERSION.txt");
+}
+
+/// Create `rel` (a `/`-separated relative path) as a directory under `root`,
+/// creating any missing intermediate directories. `fatfs`' `create_dir` opens an
+/// existing directory, so creating each prefix in turn is idempotent.
+fn ensure_dir<T: ReadWriteSeek>(root: &Dir<T>, rel: &str) {
+    let mut prefix = String::new();
+    for component in rel.split('/').filter(|c| !c.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        root.create_dir(&prefix)
+            .unwrap_or_else(|e| panic!("failed to create dir {prefix:?}: {e:?}"));
+    }
+}
+
+/// Committer date of HEAD, broken down in local time; stamps the source snapshot.
+/// Falls back to [`FALLBACK`] if git is unavailable.
+fn head_stamp(repo_dir: &Path) -> Stamp {
+    git_output(
+        repo_dir,
+        &[
+            "log",
+            "-1",
+            "--format=%cd",
+            "--date=format-local:%Y %m %d %H %M %S",
+            "HEAD",
+        ],
+    )
+    .and_then(|s| parse_stamp(&s))
+    .unwrap_or(FALLBACK)
+}
+
+/// Run `git -C <repo_dir> <args...>` and return its trimmed stdout on success.
+fn git_output(repo_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
 }
 
 /// Committer date of the last commit touching `file`, broken down in local time.

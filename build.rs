@@ -37,7 +37,10 @@ fn build_image() {
     let assets = manifest_dir.join("assets");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let image = fat_image::build(&assets, IMAGE_SIZE, &manifest_dir);
+    // Gated by the `source-snapshot` cargo feature (default on); Cargo exposes an
+    // enabled feature to the build script as `CARGO_FEATURE_<NAME>`.
+    let bundle_source = env::var_os("CARGO_FEATURE_SOURCE_SNAPSHOT").is_some();
+    let image = fat_image::build(&assets, IMAGE_SIZE, &manifest_dir, bundle_source);
 
     // Deduplicate identical chunks before compressing. Runs of identical sectors
     // (most commonly the all-zero free space of a sparse volume) collapse to a
@@ -100,12 +103,20 @@ fn build_image() {
     // (Cargo already re-runs this script when build.rs changes.)
     println!("cargo:rerun-if-changed=build/fat_image.rs");
     rerun_if_changed_recursive(&assets);
-    // Entry timestamps come from git history, so a new commit can change the
-    // image even when no asset file does; watch the reflog to catch commits.
-    let git_log = manifest_dir.join(".git/logs/HEAD");
-    if git_log.exists() {
-        println!("cargo:rerun-if-changed={}", git_log.display());
+    // Entry timestamps come from git history, and the image now bundles a snapshot
+    // of `git archive HEAD` plus a `git describe` version file -- all a pure
+    // function of HEAD (and tags). Watch the reflog to catch commits/checkouts and
+    // the tag refs so `git describe` stays fresh. This is the *only* git-derived
+    // rerun surface: editing tracked source without committing does not rebuild the
+    // image, so it does not retrigger ZX0 recompression.
+    for git_path in [".git/logs/HEAD", ".git/refs/tags", ".git/packed-refs"] {
+        let path = manifest_dir.join(git_path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
+    // Rebuild the image when the source-snapshot feature is toggled on/off.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SOURCE_SNAPSHOT");
 }
 
 /// ZX0-compress each unique chunk, spreading the work across the available CPUs.

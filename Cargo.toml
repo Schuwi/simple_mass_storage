@@ -7,6 +7,13 @@ version = "0.1.0"
 authors = ["Schuwi <schuwi4@gmail.com>"]
 edition = "2021"
 
+[features]
+default = ["source-snapshot"]
+# Bundle an unpacked snapshot of the source that built the firmware (`git archive
+# HEAD`) plus a `VERSION.txt` into the embedded image, making the device
+# self-documenting. Read by build.rs at compile time (see build/fat_image.rs).
+source-snapshot = []
+
 [dependencies]
 zx0-decompress = { path = "crates/zx0-decompress", features = ["defmt"] }
 # "critical-section-single-core" needed for static_cell crate
@@ -39,6 +46,9 @@ zx0 = "1.0.0"
 # chunk decodes back to the original before it is embedded. No `defmt` here (host
 # build); the firmware enables that feature in [dependencies].
 zx0-decompress = { path = "crates/zx0-decompress" }
+# Reads the in-memory `git archive HEAD` tar stream so the FAT image can bundle an
+# unpacked snapshot of the source that built it (see build/fat_image.rs).
+tar = "0.4"
 
 
 # Set the default for dependencies.
