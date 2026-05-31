@@ -359,7 +359,42 @@ mod app {
                     scsi_state.storage_offset = 0;
                 }
             }
-            // ScsiCommand::Write not supported - write-protected
+            ScsiCommand::Write { len, .. } => {
+                // The medium is write-protected, but we must still consume the
+                // host's entire data-out phase before reporting status. If we
+                // fail the command while bytes remain untransferred, the
+                // Bulk-Only transport stalls the bulk-OUT endpoint (see
+                // `end_data_transfer`); the host then needs a Clear-Halt plus
+                // reset-recovery round trip before the device is usable again
+                // (the stall observed on the host). So drain and discard the
+                // write payload across successive polls, then fail with DATA
+                // PROTECT / WRITE PROTECTED so the host learns the medium is
+                // read-only and stops retrying.
+                let total = len as usize * IMAGE_BLOCK_SIZE as usize;
+
+                // Drain (and discard) whatever payload the host has sent so far.
+                if scsi_state.storage_offset != total {
+                    let mut scratch = [0u8; IMAGE_BLOCK_SIZE as usize];
+                    let count = command.read_data(&mut scratch)?;
+                    scsi_state.storage_offset += count;
+                }
+
+                // Reject the write only once the whole data-out phase has been
+                // consumed. This MUST happen in the same callback that drains
+                // the final byte (as the usbd-storage Write example does): once
+                // the data-out phase is empty there may be no further USB
+                // activity to drive another poll, so deferring the `fail()` to a
+                // later callback can deadlock until the host times out and
+                // resets. At this point `data_transfer_len` is 0, so failing
+                // does not stall the bulk-OUT endpoint.
+                if scsi_state.storage_offset == total {
+                    scsi_state.sense_key.replace(0x07); // DATA PROTECT
+                    scsi_state.sense_key_code.replace(0x27); // WRITE PROTECTED
+                    scsi_state.sense_qualifier.replace(0x00);
+                    scsi_state.storage_offset = 0;
+                    command.fail();
+                }
+            }
             ScsiCommand::ModeSense6 { .. } => {
                 command.try_write_data_all(&[
                     0x03, // number of bytes that follow
