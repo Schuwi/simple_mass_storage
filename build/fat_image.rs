@@ -32,7 +32,7 @@ use fatfs::{
 const VOLUME_ID: u32 = 0x1234_5678;
 
 /// Volume label (max 11 chars, space-padded on disk).
-const VOLUME_LABEL: &[u8] = b"MASS STORE";
+const VOLUME_LABEL: &[u8] = b"STM ARCHIVE";
 
 /// FAT date/time for entries with no git history (1980-01-01 00:00:00, the
 /// earliest representable FAT timestamp).

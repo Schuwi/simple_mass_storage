@@ -265,8 +265,8 @@ mod app {
                     0x00, // additional fields, none set
                     0x00, // additional fields, none set
                     b'S', b'C', b'H', b'U', b'W', b'I', b' ', b' ', // 8-byte T-10 vendor id
-                    b'S', b'h', b'a', b'r', b'e', b'd', b' ', b'S', b'e', b'c', b'r', b'e', b't',
-                    b's', b' ', b' ', // 16-byte product identification
+                    b'S', b'T', b'M', b'3', b'2', b' ', b'A', b'r', b'c', b'h', b'i', b'v', b'e',
+                    b' ', b' ', b' ', // 16-byte product identification
                     b' ', b'0', b'.', b'1', // 4-byte product revision
                 ])?;
                 command.pass();
