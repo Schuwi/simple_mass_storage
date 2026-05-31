@@ -1,0 +1,17 @@
+# Standalone host-side helper for managing the (non-redistributable) SEGGER
+# emUSB-Device vendored files. Its own `[workspace]` keeps it out of the firmware
+# workspace, so the firmware's forced `thumbv7em` target does not apply here.
+# Run it via the `cargo xtask` alias (see .cargo/config.toml).
+[workspace]
+
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+md-5 = "0.10"

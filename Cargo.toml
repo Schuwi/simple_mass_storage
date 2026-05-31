@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/zx0-decompress"]
+# `xtask` is a host-side helper with its own workspace; exclude it so the
+# firmware's forced `thumbv7em` target never tries to build it.
+exclude = ["xtask"]
 
 [package]
 name = "simple_mass_storage"
@@ -24,9 +27,6 @@ rtic = { version = "2", features = ["thumbv7-backend"] }
 defmt-rtt = "1.2.0"
 defmt = "1.1.0"
 static_cell = "2.1.1"
-# USB is provided by the vendored SEGGER emUSB-Device stack (linked via build.rs +
-# bindgen, see src/segger/). The previous pure-Rust stack (usb-device /
-# usbd-storage) has been removed in favour of it.
 stm32-device-signature = { version = "0.3.3", features = ["stm32f4"] }
 
 [dependencies.stm32f4xx-hal]
@@ -43,6 +43,9 @@ reqwest = { version = "0.11", features = ["blocking"] }
 # locally from the user's own licensed headers and never committed. Requires
 # libclang at build time (see docs/SEGGER_SETUP.md).
 bindgen = "0.72"
+# Verifies the vendored SEGGER files against vendor/segger.lock at build time
+# (see build/segger.rs) so silent version drift fails the build loudly.
+sha2 = "0.10"
 # Builds the embedded FAT image from `assets/` at compile time (see build.rs /
 # build/fat_image.rs). `chrono` is disabled on purpose so the default time
 # provider is `NullTimeProvider`, keeping the generated image reproducible.

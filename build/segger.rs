@@ -13,6 +13,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use sha2::Digest;
+
 /// emUSB-Device version this firmware is developed/locked against (the
 /// "SEGGER emPower, Embedded Studio" eval bundle dated 2023-06-26).
 const LOCKED_BUNDLE: &str = "SEGGER emPower, Embedded Studio (2023-06-26)";
@@ -52,6 +54,12 @@ pub fn build() {
         fail_missing(&usbd_dir, &missing);
     }
 
+    // ---- verify file identity against the committed lockfile ---------------------
+    // The vendor root is the parent of <USB-D>; the lock paths are relative to it.
+    if let Some(vendor_root) = usbd_dir.parent() {
+        verify_lock(&manifest_dir.join("vendor/segger.lock"), vendor_root);
+    }
+
     // ---- link the prebuilt emUSB-Device archive ----------------------------------
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static={LIB_NAME}");
@@ -67,6 +75,71 @@ pub fn build() {
     println!("cargo:rerun-if-changed={}", lib_file.display());
     println!("cargo:rerun-if-changed={}", inc.join("USB.h").display());
     println!("cargo:rerun-if-changed={}", inc.join("USB_MSD.h").display());
+}
+
+/// Verify every file listed in `vendor/segger.lock` against its recorded SHA-256.
+/// A missing lock is only a warning (a bring-your-own copy may not be locked yet);
+/// any checksum mismatch is a hard error, since it means the linked binary differs
+/// from what this firmware was verified against. Also emits `rerun-if-changed` for
+/// each locked file so the build re-verifies (and bindgen regenerates) on change.
+fn verify_lock(lock: &Path, vendor_root: &Path) {
+    println!("cargo:rerun-if-changed={}", lock.display());
+    let Ok(text) = std::fs::read_to_string(lock) else {
+        println!(
+            "cargo:warning=vendor/segger.lock not found; skipping SEGGER checksum \
+             verification. Run `cargo xtask relock-segger` to pin file identities."
+        );
+        return;
+    };
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((want, rel)) = line.split_once("  ") else {
+            continue;
+        };
+        let path = vendor_root.join(rel);
+        println!("cargo:rerun-if-changed={}", path.display());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let got = hex(&sha2::Sha256::digest(&bytes));
+                if got != want {
+                    mismatches.push(format!("    {rel} (have {}…, want {}…)", &got[..12], &want[..12]));
+                }
+            }
+            Err(_) => mismatches.push(format!("    {rel} (missing)")),
+        }
+    }
+
+    if !mismatches.is_empty() {
+        let list = mismatches.join("\n");
+        panic!(
+            "\n\
+================================================================================\n\
+ Vendored SEGGER files do not match vendor/segger.lock:\n\
+{list}\n\
+\n\
+ The linked emUSB-Device binary would differ from what this firmware was\n\
+ verified against. If you intentionally moved to a newer SEGGER version and the\n\
+ build/device work, re-pin with:\n\
+     cargo xtask relock-segger\n\
+ Otherwise re-provision a clean copy:\n\
+     cargo xtask setup-segger --zip <path-to-eval.zip>\n\
+ See docs/SEGGER_SETUP.md.\n\
+================================================================================\n"
+        );
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn generate_bindings(
