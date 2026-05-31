@@ -597,7 +597,12 @@ fn add_dir<T: ReadWriteSeek>(
 }
 
 /// Bundle an unpacked snapshot of the committed source (`git archive HEAD`) under
-/// `source/` in the FAT root, so the device documents the exact tree that built it.
+/// `source/` in the FAT root, so the device documents the tree that built it.
+///
+/// `assets/` is excluded from the snapshot: those files already live (browsable) at
+/// the drive root, and ZX0's 32 KiB window can't dedup the two far-apart copies, so
+/// bundling them again would double their flash cost (the lone `:(exclude)assets`
+/// pathspec means "everything except assets/").
 ///
 /// The archive is streamed through the `tar` crate in memory -- no temp files and no
 /// external `tar` binary. Every entry shares HEAD's committer date (one git call),
@@ -607,7 +612,7 @@ fn add_source_snapshot<T: ReadWriteSeek>(root: &Dir<T>, repo_dir: &Path) {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_dir)
-        .args(["archive", "--format=tar", "HEAD"])
+        .args(["archive", "--format=tar", "HEAD", "--", ":(exclude)assets"])
         .output()
         .expect("failed to run `git archive`");
     assert!(
