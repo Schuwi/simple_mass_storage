@@ -24,17 +24,25 @@ rtic = { version = "2", features = ["thumbv7-backend"] }
 defmt-rtt = "1.2.0"
 defmt = "1.1.0"
 static_cell = "2.1.1"
-usb-device = "0.3.2"
-usbd-storage = { version = "2.0.0", features = ["bbb", "defmt", "scsi"] }
+# USB is provided by the vendored SEGGER emUSB-Device stack (linked via build.rs +
+# bindgen, see src/segger/). The previous pure-Rust stack (usb-device /
+# usbd-storage) has been removed in favour of it.
 stm32-device-signature = { version = "0.3.3", features = ["stm32f4"] }
 
 [dependencies.stm32f4xx-hal]
 version = "0.23.0"
-features = ["stm32f401", "rtic2", "defmt", "usb_fs"]
+# Used for the clock tree, GPIO (PA11/PA12 -> AF10) and OTG_FS clock gating only;
+# the SEGGER ST_STM32F4xxFS driver drives the OTG core itself, so no `usb_fs`.
+features = ["stm32f401", "rtic2", "defmt"]
 
 
 [build-dependencies]
 reqwest = { version = "0.11", features = ["blocking"] }
+# Generates Rust FFI bindings from the vendored SEGGER emUSB-Device headers into
+# `$OUT_DIR/segger_bindings.rs` (see build/segger.rs). Bindings are generated
+# locally from the user's own licensed headers and never committed. Requires
+# libclang at build time (see docs/SEGGER_SETUP.md).
+bindgen = "0.72"
 # Builds the embedded FAT image from `assets/` at compile time (see build.rs /
 # build/fat_image.rs). `chrono` is disabled on purpose so the default time
 # provider is `NullTimeProvider`, keeping the generated image reproducible.

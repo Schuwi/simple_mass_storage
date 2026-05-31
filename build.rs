@@ -1,5 +1,7 @@
 #[path = "build/fat_image.rs"]
 mod fat_image;
+#[path = "build/segger.rs"]
+mod segger;
 
 use std::collections::HashMap;
 use std::env;
@@ -25,6 +27,7 @@ const CHUNK_SIZE: usize = 32 * 1024;
 fn main() {
     download_svd();
     build_image();
+    segger::build();
 }
 
 /// Build the FAT image from `assets/`, split it into [`CHUNK_SIZE`] chunks,
