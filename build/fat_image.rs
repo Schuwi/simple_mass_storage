@@ -24,9 +24,26 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fatfs::{
-    Date, DateTime, Dir, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek, Time,
+    Date, DateTime, Dir, FatType, FileSystem, FormatVolumeOptions, FsOptions, ReadWriteSeek, Time,
     TimeProvider,
 };
+
+/// Start of the first (and only) partition, in 512-byte LBA sectors. 2048 (= 1
+/// MiB) is the alignment every modern partitioner (Windows, Linux, Android)
+/// defaults to, so it is the most broadly recognised. The skipped sectors are
+/// all-zero and dedupe/ZX0-compress to nothing in the embedded blob, so the only
+/// real cost is 1 MiB of the volume's addressable space.
+const PART_START_LBA: u64 = 2048;
+
+/// MBR partition-type byte for a FAT16 volume addressed via LBA. The LBA variant
+/// (0x0E, vs the CHS 0x04/0x06) is the one removable-media hosts recognise most
+/// reliably, and the layout this builder deliberately emits and verifies.
+const PART_TYPE_FAT16_LBA: u8 = 0x0E;
+
+/// Bytes per cluster we format the volume with. One sector (512 B) keeps the
+/// small partition above the FAT16 cluster floor so it is FAT16 rather than
+/// FAT12; see the `bytes_per_cluster` call in [`build`].
+const CLUSTER_SIZE: u32 = 512;
 
 /// Fixed 32-bit volume serial, matching the Python tool's default.
 const VOLUME_ID: u32 = 0x1234_5678;
@@ -96,27 +113,50 @@ impl TimeProvider for GitTimeProvider {
     }
 }
 
-/// Build a `size`-byte FAT image whose root directory mirrors `src_dir`,
-/// stamping entries with git commit times resolved against the `repo_dir` work
-/// tree.
+/// Build a `size`-byte disk image whose single partition holds a FAT filesystem
+/// mirroring `src_dir`, stamping entries with git commit times resolved against
+/// the `repo_dir` work tree.
 ///
-/// `size` must be a multiple of the 512-byte sector size. Panics (the right move
-/// in a build script) on any error, including the tree not fitting in `size`.
+/// The image carries a real MBR partition table (one partition starting at
+/// [`PART_START_LBA`]) rather than the bare "superfloppy" layout (a filesystem at
+/// LBA 0 with no partition table). Hosts that only mount filesystems found via a
+/// partition table -- notably Android -- reject a superfloppy, so the MBR is what
+/// makes the device mount there.
+///
+/// `size` must be a multiple of the 512-byte sector size and large enough to hold
+/// the MBR plus a partition. Panics (the right move in a build script) on any
+/// error, including the tree not fitting in the partition.
 pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) -> Vec<u8> {
     assert!(
         size % 512 == 0,
         "image size {size} is not a multiple of the 512-byte sector size"
     );
+    let total_sectors = (size / 512) as u64;
+    assert!(
+        total_sectors > PART_START_LBA,
+        "image size {size} is too small to hold an MBR plus a partition at LBA {PART_START_LBA}"
+    );
+    let part_sectors = total_sectors - PART_START_LBA;
+    let part_size = part_sectors as usize * 512;
 
     // `fatfs` works against any seekable byte sink; an in-memory zeroed buffer
-    // gives us the raw image directly. The FAT type is auto-selected from the
-    // resulting cluster count (FAT12 for small volumes like the default 256 KiB).
-    let mut cursor = Cursor::new(vec![0u8; size]);
+    // gives us the raw partition contents directly. The FAT type is auto-selected
+    // from the resulting cluster count. We format only the partition region here
+    // and splice it in behind the MBR below.
+    let mut cursor = Cursor::new(vec![0u8; part_size]);
 
     fatfs::format_volume(
         &mut cursor,
         FormatVolumeOptions::new()
             .bytes_per_sector(512)
+            // Pin the cluster size to one sector. `fatfs` otherwise scales clusters
+            // up for small volumes (2 KiB here) and, since the partition is < 4 MiB,
+            // estimates FAT12 -- which removable-media hosts (Android especially)
+            // mount least reliably. With 512-byte clusters the 3 MiB partition holds
+            // ~6000 clusters, so `fatfs` auto-selects FAT16 from the cluster count.
+            // (We steer the count via the cluster size rather than forcing
+            // `fat_type`, which the crate flags as fragile.)
+            .bytes_per_cluster(CLUSTER_SIZE)
             .fats(2)
             .max_root_dir_entries(512)
             .volume_id(VOLUME_ID)
@@ -125,11 +165,14 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) 
     .expect("failed to format FAT volume");
 
     let mut uncommitted = Vec::new();
+    let fat_type;
     {
         // Borrow `cursor` so we can reclaim its buffer once the filesystem is
         // unmounted (which flushes all pending writes).
         let fs = FileSystem::new(&mut cursor, FsOptions::new().time_provider(&GIT_TP))
             .expect("failed to open FAT filesystem");
+        // Record the auto-selected FAT type so the MBR partition entry can name it.
+        fat_type = fs.fat_type();
         add_dir(&fs.root_dir(), src_dir, repo_dir, &mut uncommitted);
         // Make the device self-documenting: bundle the source that built it and a
         // file naming the build version (gated by the `source-snapshot` feature).
@@ -150,7 +193,77 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) 
         );
     }
 
-    cursor.into_inner()
+    // Assemble the full disk: MBR in sector 0, then the formatted partition at
+    // PART_START_LBA. The gap between them stays zero.
+    let mut image = vec![0u8; size];
+    let part_off = PART_START_LBA as usize * 512;
+    image[part_off..part_off + part_size].copy_from_slice(&cursor.into_inner());
+    write_mbr(&mut image, PART_START_LBA, part_sectors, fat_type);
+
+    println!(
+        "cargo:warning=MBR disk: 1 partition ({fat_type:?}) at LBA {PART_START_LBA}, \
+         {part_sectors} sectors ({} KiB usable)",
+        part_size / 1024
+    );
+
+    image
+}
+
+/// Write a single-partition MBR into sector 0 of `image`, describing a partition
+/// that starts at `start_lba` and spans `sectors`, holding a `fat_type` volume.
+///
+/// The 446-byte boot-code area is left zero -- this is a data disk, not bootable.
+/// Only the partition table and the 0x55AA boot signature are populated. LBA
+/// fields are authoritative for every host that matters today; the CHS fields are
+/// filled in with the conventional geometry purely for legacy tooling.
+fn write_mbr(image: &mut [u8], start_lba: u64, sectors: u64, fat_type: FatType) {
+    /// Offset of the first partition entry within the MBR.
+    const TABLE: usize = 446;
+
+    // MBR partition-type byte. The LBA-aware variants (0x0C/0x0E) are the ones
+    // removable-media hosts recognise most reliably; FAT12 has no LBA variant.
+    let part_type: u8 = match fat_type {
+        FatType::Fat12 => 0x01,
+        FatType::Fat16 => PART_TYPE_FAT16_LBA,
+        FatType::Fat32 => 0x0C, // FAT32 (LBA)
+    };
+
+    let entry = &mut image[TABLE..TABLE + 16];
+    entry[0] = 0x00; // status: not bootable
+    let (h, s, c) = chs(start_lba);
+    entry[1] = h;
+    entry[2] = s;
+    entry[3] = c;
+    entry[4] = part_type;
+    let (h, s, c) = chs(start_lba + sectors - 1);
+    entry[5] = h;
+    entry[6] = s;
+    entry[7] = c;
+    entry[8..12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    entry[12..16].copy_from_slice(&(sectors as u32).to_le_bytes());
+
+    image[510] = 0x55;
+    image[511] = 0xAA;
+}
+
+/// Convert an LBA to the packed 3-byte CHS triple `(head, sector|cyl-hi, cyl-lo)`
+/// stored in an MBR partition entry, using the conventional 255-head/63-sector
+/// geometry. LBAs past the CHS limit (~8 GB) clamp to the maximum value
+/// (0xFE/0xFF/0xFF), the marker LBA-addressing hosts expect.
+fn chs(lba: u64) -> (u8, u8, u8) {
+    const HEADS: u64 = 255;
+    const SPT: u64 = 63;
+    let cyl = lba / (HEADS * SPT);
+    if cyl > 1023 {
+        return (0xFE, 0xFF, 0xFF);
+    }
+    let head = (lba / SPT) % HEADS;
+    let sector = lba % SPT + 1;
+    (
+        head as u8,
+        (((cyl >> 2) as u8) & 0xC0) | (sector as u8 & 0x3F),
+        (cyl & 0xFF) as u8,
+    )
 }
 
 /// Recursively copy the contents of `path` into the FAT directory `dir`.
