@@ -194,7 +194,7 @@ fn download_svd() {
     // Retrieve the target chip series from the environment variable
     let target = "stm32f401.svd";
 
-    let file_name = format!("{target}.svd");
+    let file_name = format!("{target}");
     let output_path = Path::new(&file_name);
     let url = format!("https://stm32-rs.github.io/stm32-rs/{target}.patched");
 
