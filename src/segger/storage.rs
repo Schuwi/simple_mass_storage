@@ -9,7 +9,7 @@
 //! otherwise stall the OTG_FS interrupt and the SysTick tick.
 
 use core::ffi::{c_schar, c_uchar, c_ulong, c_void};
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use crate::image;
 use crate::IMAGE_BLOCK_SIZE;
@@ -127,7 +127,40 @@ fn with_store<R>(f: impl FnOnce(&mut ImageStore) -> R) -> Option<R> {
 // USB_MSD_STORAGE_API callbacks
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn pf_init(_lun: c_uchar, _driver_data: *const sys::USB_MSD_INST_DATA_DRIVER) {}
+// The transfer buffer the MSD class fills via `pfRead`. The class obtains it
+// through `pfGetReadBuffer` (and `pfGetWriteBuffer`); SEGGER hands it to us once
+// in `pfInit` as `DriverData.pSectorBuffer` (set up in `segger::start`). Captured
+// here so the buffer hooks can return it. Only touched from task context.
+static XFER_BUF: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static XFER_BUF_SECTORS: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn pf_init(_lun: c_uchar, driver_data: *const sys::USB_MSD_INST_DATA_DRIVER) {
+    if !driver_data.is_null() {
+        let d = unsafe { &*driver_data };
+        XFER_BUF.store(d.pSectorBuffer as *mut u8, Ordering::Relaxed);
+        XFER_BUF_SECTORS.store(d.NumBytes4Buffer / IMAGE_BLOCK_SIZE, Ordering::Relaxed);
+    }
+}
+
+/// Hand the class the transfer buffer and the max sectors it holds. The class
+/// then calls `pfRead`/`pfWrite` with this buffer. Required for both read and
+/// write flows (a null hook is a hard fault on the host's first access).
+unsafe extern "C" fn pf_get_buffer(
+    _lun: c_uchar,
+    _sector_index: c_ulong,
+    pp_data: *mut *mut c_void,
+    num_sectors: c_ulong,
+) -> c_ulong {
+    let buf = XFER_BUF.load(Ordering::Relaxed);
+    if !pp_data.is_null() {
+        unsafe { *pp_data = buf as *mut c_void };
+    }
+    let cap = XFER_BUF_SECTORS.load(Ordering::Relaxed);
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    core::cmp::min(num_sectors, cap)
+}
 
 unsafe extern "C" fn pf_get_info(_lun: c_uchar, p_info: *mut sys::USB_MSD_INFO) {
     if !p_info.is_null() {
@@ -176,9 +209,9 @@ unsafe extern "C" fn pf_deinit(_lun: c_uchar) {}
 pub static STORAGE_API: sys::USB_MSD_STORAGE_API = sys::USB_MSD_STORAGE_API {
     pfInit: Some(pf_init),
     pfGetInfo: Some(pf_get_info),
-    pfGetReadBuffer: None,
+    pfGetReadBuffer: Some(pf_get_buffer),
     pfRead: Some(pf_read),
-    pfGetWriteBuffer: None,
+    pfGetWriteBuffer: Some(pf_get_buffer),
     pfWrite: Some(pf_write),
     pfMediumIsPresent: Some(pf_medium_is_present),
     pfDeInit: Some(pf_deinit),
