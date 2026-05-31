@@ -18,6 +18,7 @@
 //! is safe.
 
 use std::cell::Cell;
+use std::env;
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -206,7 +207,119 @@ pub fn build(src_dir: &Path, size: usize, repo_dir: &Path, bundle_source: bool) 
         part_size / 1024
     );
 
+
+    // Guard the wide-compatibility layout against regressions: cheap byte-level
+    // checks on the hand-written MBR, plus an independent `fsck.fat` pass over the
+    // filesystem properties.
+    verify_mbr(&image, part_sectors);
+    verify_filesystem(&image[part_off..part_off + part_size]);
+
     image
+}
+
+/// Assert the hand-written MBR describes exactly one partition with the layout we
+/// emit. Reads the raw table bytes back -- independent of `fatfs`, which never
+/// touches the MBR -- so a regression in [`write_mbr`] fails the build.
+fn verify_mbr(image: &[u8], part_sectors: u64) {
+    const TABLE: usize = 446;
+    assert_eq!(
+        [image[510], image[511]],
+        [0x55, 0xAA],
+        "MBR is missing the 0x55AA boot signature"
+    );
+
+    let entry = &image[TABLE..TABLE + 16];
+    assert_eq!(
+        entry[4], PART_TYPE_FAT16_LBA,
+        "partition 1 type is {:#04x}, expected FAT16-LBA ({PART_TYPE_FAT16_LBA:#04x})",
+        entry[4]
+    );
+    assert_eq!(
+        u32::from_le_bytes(entry[8..12].try_into().unwrap()),
+        PART_START_LBA as u32,
+        "partition 1 does not start at LBA {PART_START_LBA}"
+    );
+    assert_eq!(
+        u32::from_le_bytes(entry[12..16].try_into().unwrap()),
+        part_sectors as u32,
+        "partition 1 does not span the rest of the disk ({part_sectors} sectors)"
+    );
+
+    // Exactly one partition: the other three table entries must be empty.
+    for i in 1..4 {
+        let other = &image[TABLE + i * 16..TABLE + (i + 1) * 16];
+        assert!(
+            other.iter().all(|&b| b == 0),
+            "MBR partition entry #{} is not empty; expected a single partition",
+            i + 1
+        );
+    }
+}
+
+/// Validate the formatted partition with an independent FAT implementation
+/// (`fsck.fat` from dosfstools), rather than re-reading it with the same `fatfs`
+/// crate that wrote it. Asserts the volume is FAT16 with 512-byte clusters -- the
+/// properties that keep it broadly mountable.
+///
+/// Skips (with a `cargo:warning`) when `SMS_SKIP_IMAGE_CHECK` is set or when no
+/// `fsck.fat` is on `PATH`, so the build stays hermetic on machines without
+/// dosfstools. Set the env var to silence the "not installed" warning.
+fn verify_filesystem(part: &[u8]) {
+    // Re-run the image build (and thus this check) when the skip toggle changes.
+    println!("cargo:rerun-if-env-changed=SMS_SKIP_IMAGE_CHECK");
+    if std::env::var_os("SMS_SKIP_IMAGE_CHECK").is_some() {
+        println!("cargo:warning=SMS_SKIP_IMAGE_CHECK set; skipping fsck.fat image check");
+        return;
+    }
+
+    // dosfstools ships the checker as `fsck.fat` (older systems: `dosfsck`). It
+    // installs under /sbin, which is commonly absent from a non-root `PATH`, so
+    // probe the usual sbin locations explicitly as well as the bare names.
+    let Some(tool) = ["fsck.fat", "dosfsck"]
+        .into_iter()
+        .flat_map(|name| {
+            [
+                name.to_string(),
+                format!("/sbin/{name}"),
+                format!("/usr/sbin/{name}"),
+                format!("/usr/local/sbin/{name}"),
+            ]
+        })
+        .find(|t| Command::new(t).arg("--help").output().is_ok())
+    else {
+        println!(
+            "cargo:warning=fsck.fat (dosfstools) not found on PATH or in /sbin; skipping \
+             the independent image check. Install dosfstools or set SMS_SKIP_IMAGE_CHECK=1 \
+             to silence."
+        );
+        return;
+    };
+
+    // fsck.fat operates on a bare filesystem, so check the partition region alone.
+    let img = PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| ".".into()))
+        .join("verify_part.img");
+    fs::write(&img, part).expect("failed to stage partition image for fsck.fat");
+
+    // `-n` = read-only (answer "no" to any repair prompt); `-v` = verbose, which
+    // prints the cluster size and FAT bit-width we assert on.
+    let output = Command::new(&tool)
+        .args(["-n", "-v"])
+        .arg(&img)
+        .output()
+        .expect("failed to run fsck.fat");
+    let report = String::from_utf8_lossy(&output.stdout);
+    let _ = fs::remove_file(&img);
+
+    // fsck.fat -v prints e.g. "512 bytes per cluster" and "2 FATs, 16 bit entries".
+    assert!(
+        report.contains(&format!("{CLUSTER_SIZE} bytes per cluster")),
+        "fsck.fat did not confirm {CLUSTER_SIZE}-byte clusters:\n{report}"
+    );
+    assert!(
+        report.contains("16 bit entries"),
+        "fsck.fat did not confirm a 16-bit (FAT16) FAT:\n{report}"
+    );
+    println!("cargo:warning=fsck.fat ({tool}) verified the FAT16 image");
 }
 
 /// Write a single-partition MBR into sector 0 of `image`, describing a partition
